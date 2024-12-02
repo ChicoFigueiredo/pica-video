@@ -12,6 +12,7 @@ from time import time
 from multiprocessing import Process, Queue, set_start_method
 from faster_whisper import WhisperModel
 import torch  # Import torch to check for GPU availability
+from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer  # Import for translation
 
 # Set multiprocessing start method to 'spawn'
 set_start_method('spawn', force=True)
@@ -113,26 +114,71 @@ def processar_frames(caminho_video, pasta_saida, fila_progresso):
         fila_progresso.put(f"Erro ao processar frames: {e}")
 
 
-def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idioma="pt"):
+def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idioma=None):
     """Transcreve áudio do vídeo ou arquivo MP3 usando o Faster-Whisper."""
     try:
         logging.info(f"Iniciando Transcrição do áudio usando o Faster-Whisper")
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Especificar o caminho ou tamanho do modelo para o WhisperModel
-        modelo_whisper = WhisperModel(model_size_or_path=nome_modelo, device=device, compute_type="int8")  # Carregar o modelo com faster-whisper
+        # Carregar o modelo Whisper
+        modelo_whisper = WhisperModel(model_size_or_path=nome_modelo, device=device, compute_type="int8")
         logging.debug(f"Modelo {nome_modelo} carregado com sucesso.")
 
-        # Transcrever o áudio
+        # Transcrever o áudio com detecção automática de idioma
         segmentos, info = modelo_whisper.transcribe(caminho_audio, beam_size=5, language=idioma)
+        detected_language = info.language  # Acessar 'language' diretamente
+        logging.info(f"Linguagem detectada: {detected_language}")
 
-        logging.debug(f"Transcrição completa. Info: {info}")
+        # Caminhos para os arquivos
+        base_path = caminho_audio.rsplit(".", 1)[0]
+        caminho_srt = f"{base_path}.srt"
+        caminho_fala_cronometrada = f"{base_path}-Fala.Cronometrada.txt"
 
-        caminho_srt = caminho_audio.replace(".mp4", ".srt").replace(".mp3", ".srt")
-        caminho_fala_cronometrada = caminho_audio.replace(".mp4", "-Fala.Cronometrada.txt").replace(".mp3", "-Fala.Cronometrada.txt")
+        if detected_language == "en":
 
-        logging.info(f"Salvando SRT / Fala Cronometrada")
+            # Traduzir para português brasileiro
+            logging.info("Iniciando tradução para português brasileiro.")
+            tokenizer = M2M100Tokenizer.from_pretrained("facebook/m2m100_418M")
+            translation_model = M2M100ForConditionalGeneration.from_pretrained("facebook/m2m100_418M").to(device)
+
+            tokenizer.src_lang = "en"
+            translated_segments = []
+
+            for segmento in segmentos:
+                texto = segmento.text.strip()
+                # Preparar o texto para tradução
+                encoded = tokenizer(texto, return_tensors="pt").to(device)
+                # Gerar tradução
+                generated_tokens = translation_model.generate(**encoded, forced_bos_token_id=tokenizer.get_lang_id("pt"))
+                translated_text = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+                # Atualizar o texto do segmento com a tradução
+                segmento.text = translated_text
+                translated_segments.append(segmento)
+                logging.info(f"{formatar_timestamp(segmento.start)} --> en='{segmento.text}' | pt='{translated_text}'")
+
+            # Salvar transcrição em inglês
+            logging.info("Salvando transcrição em inglês.")
+            caminho_srt_en = f"{base_path}-en.srt"
+            caminho_fala_cronometrada_en = f"{base_path}-en-Fala.Cronometrada.txt"
+
+            salvar_transcricao(segmentos, caminho_srt_en, caminho_fala_cronometrada_en)
+
+            logging.info("Salvando transcrição em português.")
+            # Salvar tradução em português
+            salvar_transcricao(translated_segments, caminho_srt, caminho_fala_cronometrada)
+        else:
+            # Salvar transcrição no idioma detectado (ex: 'pt')
+            salvar_transcricao(segmentos, caminho_srt, caminho_fala_cronometrada)
+
+        logging.info(f"Arquivos de transcrição gerados.")
+    except Exception as e:
+        logging.error(f"Erro ao transcrever áudio para {caminho_audio}: {e}", exc_info=True)
+        raise
+
+def salvar_transcricao(segmentos, caminho_srt, caminho_fala_cronometrada):
+    """Salva os segmentos transcritos em arquivos SRT e de Fala Cronometrada."""
+    try:
         with open(caminho_srt, "w", encoding="utf-8") as arquivo_srt:
             with open(caminho_fala_cronometrada, "w", encoding="utf-8") as arquivo_txt:
                 for segmento in segmentos:
@@ -141,7 +187,7 @@ def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idio
                     texto = segmento.text.strip()
 
                     logging.info(f"Salvando segmento {segmento.id} {formatar_timestamp(inicio)} --> {formatar_timestamp(fim)} {texto}")
-                    
+
                     # Arquivo SRT
                     arquivo_srt.write(f"{segmento.id}\n")
                     arquivo_srt.write(f"{formatar_timestamp(inicio)} --> {formatar_timestamp(fim)}\n")
@@ -149,10 +195,8 @@ def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idio
 
                     # Arquivo de texto Fala Cronometrada
                     arquivo_txt.write(f"{formatar_timestamp(inicio)}: {texto}\n")
-
-        logging.info(f"Arquivos de transcrição gerados: {caminho_srt}, {caminho_fala_cronometrada}")
     except Exception as e:
-        logging.error(f"Erro ao transcrever áudio para {caminho_audio}: {e}", exc_info=True)
+        logging.error(f"Erro ao salvar transcrição: {e}", exc_info=True)
         raise
 
 def formatar_timestamp(segundos):
@@ -180,7 +224,7 @@ def processar_transcricao(caminho_video, nome_modelo, fila_progresso):
 def encontrar_arquivos_mascara(mascara, recursivo):
     """Encontra arquivos com base na máscara fornecida, mesmo em subpastas vazias."""
     try:
-        if recursivo:
+        if (recursivo):
             # Usar "**/" para garantir busca recursiva por todas as subpastas
             caminho_completo = os.path.join("**", mascara)  # Exemplo: '**/*.mp4'
             return glob.glob(caminho_completo, recursive=True)
