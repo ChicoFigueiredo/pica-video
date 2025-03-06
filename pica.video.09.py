@@ -14,6 +14,14 @@ from faster_whisper import WhisperModel
 import torch  # Import torch to check for GPU availability
 from transformers import M2M100ForConditionalGeneration, M2M100Tokenizer  # Import for translation
 
+# Import Tkinter modules
+import tkinter as tk
+from tkinter import ttk
+from tkinter import messagebox
+
+# Import ttkthemes for theming
+from ttkthemes import ThemedTk
+
 # Set multiprocessing start method to 'spawn'
 set_start_method('spawn', force=True)
 
@@ -108,13 +116,19 @@ def processar_frames(caminho_video, pasta_saida, fila_progresso):
         # Renomear frames
         renomear_frames(tempos_frames, pasta_saida, nome_base)
 
+        # Send progress updates to the queue
+        total_frames = len(tempos_frames)
+        for i, (minutos, segundos, milissegundos) in enumerate(tqdm(tempos_frames, desc="Renomeando frames", unit="frame")):
+            # ...existing renaming code...
+            progress = (i + 1) / total_frames
+            fila_progresso.put(progress)
         fila_progresso.put("Processamento de frames concluído!")
     except Exception as e:
         logging.error(f"Erro ao processar frames para {caminho_video}: {e}")
         fila_progresso.put(f"Erro ao processar frames: {e}")
 
 
-def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idioma=None):
+def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idioma=None, fila_progresso=None):
     """Transcreve áudio do vídeo ou arquivo MP3 usando o Faster-Whisper."""
     try:
         logging.info("Iniciando Transcrição do áudio usando o Faster-Whisper")
@@ -150,6 +164,9 @@ def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idio
             arquivos['fala_cron'] = open(f"{base_path}-Fala.Cronometrada.txt", "w", encoding="utf-8")
 
         segment_id = 1
+        total_segments = len(list(modelo_whisper.transcribe(caminho_audio, beam_size=5, language=idioma)[0]))
+        generator = modelo_whisper.transcribe(caminho_audio, beam_size=5, language=idioma)[0]
+        segment_id = 1
         for segmento in generator:
             inicio = segmento.start
             fim = segmento.end
@@ -182,6 +199,9 @@ def transcrever_audio_faster_whisper(caminho_audio, nome_modelo="large-v3", idio
 
                 logging.info(f"Segmento {segment_id}: {formatar_timestamp(inicio)} --> {formatar_timestamp(fim)} {texto}")
 
+            if fila_progresso:
+                progress = segment_id / total_segments
+                fila_progresso.put(progress)
             segment_id += 1
 
         # Fechar arquivos abertos
@@ -232,7 +252,7 @@ def formatar_timestamp(segundos):
 def processar_transcricao(caminho_video, nome_modelo, fila_progresso):
     """Processa a transcrição de áudio."""
     try:
-        transcrever_audio_faster_whisper(caminho_video, nome_modelo=nome_modelo)
+        transcrever_audio_faster_whisper(caminho_video, nome_modelo=nome_modelo, fila_progresso=fila_progresso)
         fila_progresso.put("Transcrição de áudio concluída!")
     except Exception as e:
         logging.error(f"Erro no processo de transcrição: {e}", exc_info=True)
@@ -271,20 +291,161 @@ def formatar_tempo_humano(tempo_segundos):
 
 def main():
     parser = argparse.ArgumentParser(description="Processa vídeos e áudios para extrair frames e gerar legendas com Faster-Whisper.")
-    parser.add_argument("mascara_arquivos", type=str, help="Máscara de arquivos para processamento (ex: *.mp4, *.mp3).")
+    parser.add_argument("mascara_arquivos", type=str, nargs='?', help="Máscara de arquivos para processamento (ex: *.mp4, *.mp3).")
     parser.add_argument("--modelo", type=str, default="large-v3", help="Modelo Whisper a ser utilizado (padrão: small).")
     parser.add_argument("--recursivo", action="store_true", help="Busca recursivamente em subdiretórios.")
     parser.add_argument("--pasta_saida", type=str, help="Pasta de saída para armazenar frames.")
     parser.add_argument("--desativar-frames", action="store_true", help="Desativa o processamento de frames.")
+    parser.add_argument("--skip-transcricao", action="store_true", help="Pula o processo de transcrição.")
     parser.add_argument("--skip-prontos", action="store_true", help="Pula arquivos já processados com '-Fala.Cronometrada.txt' maior que 1KB.")
+    
+    # Add new argument --no-interactive
+    parser.add_argument("--no-interactive", action="store_true", help="Executa o programa sem a interface gráfica.")
+
     args = parser.parse_args()
 
-    mascara_arquivos = args.mascara_arquivos
-    nome_modelo = args.modelo
-    recursivo = args.recursivo
-    desativar_frames = args.desativar_frames  # Novo argumento
-    skip_prontos = args.skip_prontos  # Novo argumento
+    if not args.no_interactive:
+        # If --no-interactive is not specified, show GUI to get parameters
 
+        def submit_parameters():
+            args.mascara_arquivos = entry_mascara_arquivos.get()
+            args.modelo = entry_modelo.get()
+            args.recursivo = var_recursivo.get()
+            args.pasta_saida = entry_pasta_saida.get() if entry_pasta_saida.get() else None
+            args.desativar_frames = var_desativar_frames.get()
+            args.skip_prontos = var_skip_prontos.get()
+            args.skip_transcricao = var_skip_transcricao.get()
+            root.destroy()
+
+        # Alterar o tema da janela principal
+        root = ThemedTk(theme="radiance")  # Novo tema para a janela de configuração
+        root.title("Configurações do Programa")
+        style = ttk.Style(root)
+        style.theme_use('radiance')  # Aplicar o novo tema
+
+        # Input fields for parameters
+        tk.Label(root, text="Máscara de Arquivos:").grid(row=0, column=0, sticky="e")
+        entry_mascara_arquivos = tk.Entry(root, width=50)
+        entry_mascara_arquivos.grid(row=0, column=1)
+        entry_mascara_arquivos.insert(0, args.mascara_arquivos if args.mascara_arquivos else "*.mp4")
+
+        tk.Label(root, text="Modelo Whisper:").grid(row=1, column=0, sticky="e")
+        entry_modelo = tk.Entry(root, width=50)
+        entry_modelo.grid(row=1, column=1)
+        entry_modelo.insert(0, args.modelo)
+
+        var_recursivo = tk.BooleanVar(value=args.recursivo)
+        tk.Checkbutton(root, text="Busca Recursiva", variable=var_recursivo).grid(row=2, column=1, sticky="w")
+
+        tk.Label(root, text="Pasta de Saída:").grid(row=3, column=0, sticky="e")
+        entry_pasta_saida = tk.Entry(root, width=50)
+        entry_pasta_saida.grid(row=3, column=1)
+        if args.pasta_saida:
+            entry_pasta_saida.insert(0, args.pasta_saida)
+
+        var_desativar_frames = tk.BooleanVar(value=args.desativar_frames)
+        tk.Checkbutton(root, text="Desativar Frames", variable=var_desativar_frames).grid(row=4, column=1, sticky="w")
+
+        var_skip_prontos = tk.BooleanVar(value=args.skip_prontos)
+        tk.Checkbutton(root, text="Pular Arquivos Prontos", variable=var_skip_prontos).grid(row=5, column=1, sticky="w")
+        
+        var_skip_transcricao = tk.BooleanVar(value=args.skip_transcricao if hasattr(args, 'skip_transcricao') else False)
+        tk.Checkbutton(root, text="Pular Transcrição", variable=var_skip_transcricao).grid(row=6, column=1, sticky="w")
+        
+        # Ajuste o número da linha para o botão "Iniciar"
+        tk.Button(root, text="Iniciar", command=submit_parameters).grid(row=7, column=1)
+
+        root.mainloop()
+
+    # Criar a janela de progresso com o novo tema
+    progress_root = ThemedTk(theme="radiance")  # Novo tema para a janela de progresso
+    progress_root.title("Progresso")
+    style = ttk.Style(progress_root)
+    style.theme_use('radiance')  # Aplicar o novo tema
+
+    # Elementos da GUI
+    tk.Label(progress_root, text="Arquivo Atual:").grid(row=0, column=0, sticky="w")
+    arquivo_label = tk.Label(progress_root, text="", font=("Arial", 12, "bold"))
+    arquivo_label.grid(row=0, column=1, sticky="w")
+
+    tk.Label(progress_root, text="Processamento de Frames:").grid(row=1, column=0, sticky="w")
+    progress_bar_frames = ttk.Progressbar(progress_root, length=400)
+    progress_bar_frames.grid(row=1, column=1)
+
+    tk.Label(progress_root, text="Transcrição de Áudio:").grid(row=2, column=0, sticky="w")
+    progress_bar_transcricao = ttk.Progressbar(progress_root, length=400)
+    progress_bar_transcricao.grid(row=2, column=1)
+
+    tk.Label(progress_root, text="Logs:").grid(row=3, column=0, sticky="nw")
+    log_label = tk.Label(progress_root, text="", justify="left", anchor="w")
+    log_label.grid(row=3, column=1, sticky="w")
+
+    # Custom logging handler to update GUI label
+    class TkinterHandler(logging.Handler):
+        def __init__(self, label):
+            super().__init__()
+            self.label = label
+
+        def emit(self, record):
+            msg = self.format(record)
+            self.label.config(text=msg)
+            self.label.update_idletasks()  # Adicione esta linha para atualizar a tela
+
+    logger = logging.getLogger()
+
+    # Do not remove existing handlers
+    # Remove the loop that removes existing handlers
+    # for handler in logger.handlers[:]:
+    #     logger.removeHandler(handler)
+
+    # Add the TkinterHandler to the logger
+    logger.addHandler(TkinterHandler(log_label))
+
+    # Set the logging level as needed
+    logger.setLevel(logging.DEBUG)
+
+    # Filas para monitorar progresso
+    fila_progresso_transcricao = Queue()
+    fila_progresso_frames = Queue()
+    fila_progresso_arquivo = Queue()  # Nova fila para o arquivo atual
+
+    # Função para atualizar a GUI periodicamente
+    def update_gui():
+        # Atualizar o nome do arquivo atual
+        if not fila_progresso_arquivo.empty():
+            current_file = fila_progresso_arquivo.get()
+            arquivo_label.config(text=current_file)
+
+        # Check progress queues
+        if not fila_progresso_frames.empty():
+            msg_frames = fila_progresso_frames.get()
+            if isinstance(msg_frames, float):
+                progress_bar_frames['value'] = msg_frames * 100
+            else:
+                log_label.config(text=msg_frames)
+
+        if not fila_progresso_transcricao.empty():
+            msg_transcricao = fila_progresso_transcricao.get()
+            if isinstance(msg_transcricao, float):
+                progress_bar_transcricao['value'] = msg_transcricao * 100
+            else:
+                log_label.config(text=msg_transcricao)
+
+        # Schedule next check
+        progress_root.after(100, update_gui)
+
+    # Start updating the GUI
+    update_gui()
+
+    # Start processing in a separate thread to avoid blocking the GUI
+    import threading
+    processing_thread = threading.Thread(target=process_files, args=(args, fila_progresso_transcricao, fila_progresso_frames, fila_progresso_arquivo))
+    processing_thread.start()
+
+    # Start the main event loop
+    progress_root.mainloop()
+
+def process_files(args, fila_progresso_transcricao, fila_progresso_frames, fila_progresso_arquivo):
     # Verificar se GPU está disponível
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logging.debug(f"Usando dispositivo: {device}")
@@ -295,12 +456,15 @@ def main():
         torch.cuda.reset_peak_memory_stats()
 
     # Usar a pasta do arquivo processado se pasta_saida não for fornecida
-    for caminho_arquivo in encontrar_arquivos_mascara(mascara_arquivos, recursivo):
+    for caminho_arquivo in encontrar_arquivos_mascara(args.mascara_arquivos, args.recursivo):
         try:
+            # Enviar o nome do arquivo atual para a fila
+            fila_progresso_arquivo.put(caminho_arquivo)
+
             # Verificar se o arquivo correspondente de fala cronometrada já existe e tem mais de 1KB
             caminho_fala_cronometrada = caminho_arquivo.replace(".mp4", "-Fala.Cronometrada.txt").replace(".mp3", "-Fala.Cronometrada.txt")
 
-            if skip_prontos and os.path.exists(caminho_fala_cronometrada) and os.path.getsize(caminho_fala_cronometrada) > 1024:
+            if args.skip_prontos and os.path.exists(caminho_fala_cronometrada) and os.path.getsize(caminho_fala_cronometrada) > 1024:
                 logging.info(f"Pulado: '{caminho_arquivo}', arquivo de fala cronometrada '{caminho_fala_cronometrada}' já existe e é maior que 1KB.")
                 continue  # Pular para o próximo arquivo
 
@@ -315,24 +479,24 @@ def main():
             logging.info(f"Processando arquivo: {caminho_arquivo}")
             logging.info(f"Pasta de saída: {pasta_saida}")
 
-            # Filas para monitorar progresso
-            fila_progresso_transcricao = Queue()
-
-            # Criar e iniciar processo de transcrição
-            processo_transcricao = Process(target=processar_transcricao, args=(caminho_arquivo, nome_modelo, fila_progresso_transcricao))
-            processo_transcricao.start()
+            if not args.skip_transcricao:
+                # Criar e iniciar processo de transcrição
+                processo_transcricao = Process(target=processar_transcricao, args=(caminho_arquivo, args.modelo, fila_progresso_transcricao))
+                processo_transcricao.start()
+            else:
+                logging.info("Processo de transcrição pulado.")
 
             # Iniciar processo de frames apenas se não estiver desativado e for um vídeo
-            if not desativar_frames and caminho_arquivo.endswith(".mp4"):
-                fila_progresso_frames = Queue()
+            if not args.desativar_frames and caminho_arquivo.endswith(".mp4"):
                 processo_frames = Process(target=processar_frames, args=(caminho_arquivo, pasta_saida, fila_progresso_frames))
                 processo_frames.start()
             else:
                 logging.info("Processamento de frames desativado ou não aplicável.")
 
             # Monitorar progresso
-            while processo_transcricao.is_alive() or (not desativar_frames and caminho_arquivo.endswith(".mp4") and processo_frames.is_alive()):
-                if not desativar_frames and caminho_arquivo.endswith(".mp4") and not fila_progresso_frames.empty():
+            while ((not args.skip_transcricao and processo_transcricao.is_alive()) or
+                   (not args.desativar_frames and caminho_arquivo.endswith(".mp4") and processo_frames.is_alive())):
+                if not args.desativar_frames and caminho_arquivo.endswith(".mp4") and not fila_progresso_frames.empty():
                     msg_frames = fila_progresso_frames.get()
                     logging.info(f"Frames: {msg_frames}")
 
@@ -341,8 +505,9 @@ def main():
                     logging.info(f"Transcrição: {msg_transcricao}")
 
             # Garantir que ambos os processos foram concluídos
-            processo_transcricao.join()
-            if not desativar_frames and caminho_arquivo.endswith(".mp4"):
+            if not args.skip_transcricao:
+                processo_transcricao.join()
+            if not args.desativar_frames and caminho_arquivo.endswith(".mp4"):
                 processo_frames.join()
 
         except Exception as e:
